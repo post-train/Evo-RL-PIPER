@@ -1,0 +1,23 @@
+---------
+can2---------can3
+can0---------can1
+
+# 目标: can0 
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="001E00385443571020393433", NAME="can0"
+
+# 目标: can1
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="004C003A5443570F20393433", NAME="can1"
+
+# 目标: can2
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="001E00225631511820313857", NAME="can2"
+
+# 目标: can3
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="004600205631511820313857", NAME="can3"
+
+sudo nano /etc/udev/rules.d/99-usb-can.rules
+
+# 重新加载 udev 规则
+sudo udevadm control --reload-rules
+
+# 触发规则
+sudo udevadm trigger

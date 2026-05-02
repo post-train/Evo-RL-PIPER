@@ -1,0 +1,3 @@
+from lerobot.policies.abpolicy.processor_ab import make_ab_pre_post_processors
+
+make_cage_pre_post_processors = make_ab_pre_post_processors
