@@ -16,7 +16,7 @@ FFMPEG_PRESET="${FFMPEG_PRESET:-veryfast}"
 FFMPEG_CRF="${FFMPEG_CRF:-18}"
 
 cmd=(
-  python /home/szk/szk/Evo-RL/downsample_lerobot_dataset.py
+  python /home/szk/szk/Evo-RL/src/lerobot/datasets/downsample_lerobot_dataset.py
   --input-root "${INPUT_ROOT}"
   --output-root "${OUTPUT_ROOT}"
   --repo-id "${REPO_ID}"

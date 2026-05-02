@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# python scan_datasets2_integrity.py \
+#     --dataset-root /home/szk/szk/Evo-RL/datasets3 \
+#     --output-prefix /home/szk/szk/Evo-RL/datasets3_report
+
 from __future__ import annotations
 
 import argparse

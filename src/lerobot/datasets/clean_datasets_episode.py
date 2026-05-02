@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# python clean_datasets_episode.py \
+#     --dataset-root "${DATASET_ROOT}" \
+#     --episode-index "${EPISODE_INDEX}"
+
+
 from __future__ import annotations
 
 import argparse
