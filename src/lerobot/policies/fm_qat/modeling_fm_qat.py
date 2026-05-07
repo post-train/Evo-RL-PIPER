@@ -1,13 +1,11 @@
 #!/usr/bin/env python
 
-import math
 import logging
+import math
 from collections import deque
-from collections.abc import Callable
-from typing import TypedDict
+from pathlib import Path
 
 import einops
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -15,7 +13,9 @@ from diffusers.training_utils import EMAModel
 from torch import Tensor, nn
 from typing_extensions import Unpack
 
-from lerobot.policies.fm.configuration_fm import FlowMatchingConfig
+from lerobot.policies.fm.modeling_fm import ActionSelectKwargs, SpatialSoftmax, _replace_submodules
+from lerobot.policies.fm_qat.configuration_fm_qat import FlowMatchingQATConfig
+from lerobot.policies.fm_qat.export_utils import export_policy_to_tensorrt
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.utils import (
@@ -29,18 +29,139 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 logger = logging.getLogger(__name__)
 
 
-class ActionSelectKwargs(TypedDict, total=False):
-    noise: Tensor | None
-    inference_delay: int | None
-    prev_chunk_left_over: Tensor | None
-    execution_horizon: int | None
+def _symmetric_scale_from_amax(amax: Tensor, eps: float) -> Tensor:
+    return torch.clamp(amax / 127.0, min=eps)
 
 
-class FlowMatchingPolicy(PreTrainedPolicy):
-    config_class = FlowMatchingConfig
-    name = "flow_matching"
+def _fake_quantize_tensor(x: Tensor, scale: Tensor) -> Tensor:
+    scale = scale.to(device=x.device, dtype=x.dtype)
+    q = torch.clamp(torch.round(x / scale), -127, 127)
+    dequant = q * scale
+    return x + (dequant - x).detach()
 
-    def __init__(self, config: FlowMatchingConfig, **kwargs):
+
+class QATActivationObserver(nn.Module):
+    def __init__(self, decay: float, eps: float):
+        super().__init__()
+        self.decay = decay
+        self.eps = eps
+        self.register_buffer("amax", torch.tensor(0.0))
+        self.register_buffer("initialized", torch.tensor(False, dtype=torch.bool))
+
+    def forward(self, x: Tensor) -> Tensor:
+        current_amax = x.detach().abs().amax()
+        if self.training:
+            if bool(self.initialized):
+                self.amax.mul_(self.decay).add_(current_amax * (1.0 - self.decay))
+            else:
+                self.amax.copy_(current_amax)
+                self.initialized.fill_(True)
+        else:
+            if not bool(self.initialized):
+                self.amax.copy_(current_amax)
+                self.initialized.fill_(True)
+
+        scale = _symmetric_scale_from_amax(self.amax, self.eps)
+        return _fake_quantize_tensor(x, scale)
+
+
+class QATModuleMixin:
+    def _make_activation_observer(self, config: FlowMatchingQATConfig) -> QATActivationObserver:
+        return QATActivationObserver(
+            decay=config.qat_activation_observer_decay,
+            eps=config.qat_activation_eps,
+        )
+
+    def _fake_quant_weight(self, weight: Tensor, eps: float) -> Tensor:
+        reduce_dims = tuple(range(1, weight.dim()))
+        amax = weight.detach().abs().amax(dim=reduce_dims, keepdim=True)
+        scale = _symmetric_scale_from_amax(amax, eps)
+        return _fake_quantize_tensor(weight, scale)
+
+
+class QATLinear(nn.Linear, QATModuleMixin):
+    def __init__(self, in_features: int, out_features: int, config: FlowMatchingQATConfig, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.qat_enabled = config.qat_enabled
+        self.qat_activation = self._make_activation_observer(config)
+        self.qat_eps = config.qat_activation_eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.qat_enabled:
+            return F.linear(x, self.weight, self.bias)
+        x = self.qat_activation(x)
+        weight = self._fake_quant_weight(self.weight, self.qat_eps)
+        return F.linear(x, weight, self.bias)
+
+
+class QATConv1d(nn.Conv1d, QATModuleMixin):
+    def __init__(self, *args, config: FlowMatchingQATConfig, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.qat_enabled = config.qat_enabled
+        self.qat_activation = self._make_activation_observer(config)
+        self.qat_eps = config.qat_activation_eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.qat_enabled:
+            return self._conv_forward(x, self.weight, self.bias)
+        x = self.qat_activation(x)
+        weight = self._fake_quant_weight(self.weight, self.qat_eps)
+        return self._conv_forward(x, weight, self.bias)
+
+
+class QATConv2d(nn.Conv2d, QATModuleMixin):
+    def __init__(self, *args, config: FlowMatchingQATConfig, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.qat_enabled = config.qat_enabled
+        self.qat_activation = self._make_activation_observer(config)
+        self.qat_eps = config.qat_activation_eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.qat_enabled:
+            return self._conv_forward(x, self.weight, self.bias)
+        x = self.qat_activation(x)
+        weight = self._fake_quant_weight(self.weight, self.qat_eps)
+        return self._conv_forward(x, weight, self.bias)
+
+
+class QATConvTranspose1d(nn.ConvTranspose1d, QATModuleMixin):
+    def __init__(self, *args, config: FlowMatchingQATConfig, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.qat_enabled = config.qat_enabled
+        self.qat_activation = self._make_activation_observer(config)
+        self.qat_eps = config.qat_activation_eps
+
+    def forward(self, x: Tensor, output_size=None) -> Tensor:
+        if not self.qat_enabled:
+            return super().forward(x, output_size=output_size)
+        x = self.qat_activation(x)
+        weight = self._fake_quant_weight(self.weight, self.qat_eps)
+        output_padding = self._output_padding(
+            x,
+            output_size,
+            self.stride,
+            self.padding,
+            self.kernel_size,
+            1,
+            self.dilation,
+        )
+        return F.conv_transpose1d(
+            x,
+            weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            output_padding,
+            self.groups,
+            self.dilation,
+        )
+
+
+class FlowMatchingQATPolicy(PreTrainedPolicy):
+    config_class = FlowMatchingQATConfig
+    name = "flow_matching_qat"
+
+    def __init__(self, config: FlowMatchingQATConfig, **kwargs):
         super().__init__(config)
         del kwargs
         config.validate_features()
@@ -51,7 +172,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         if config.rtc_config is not None:
             self.rtc_processor = RTCProcessor(config.rtc_config)
 
-        self.flow_matching = FlowMatchingModel(config)
+        self.flow_matching = FlowMatchingQATModel(config)
 
         self.ema = None
         self._ema_device_set = False
@@ -86,12 +207,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             )
             self.flow_matching._velocity_net_compiled = True
             logger.info(
-                "Enabled torch.compile for FM velocity_net with mode=%s",
+                "Enabled torch.compile for FM QAT velocity_net with mode=%s",
                 self.config.compile_mode,
             )
             self.flow_matching.warmup_compiled_velocity_net()
         except Exception as exc:
-            logger.warning("Failed to compile FM velocity_net; continuing without compile. Error: %s", exc)
+            logger.warning("Failed to compile FM QAT velocity_net; continuing without compile. Error: %s", exc)
             self.flow_matching._velocity_net_compiled = False
 
     def get_optim_params(self) -> dict:
@@ -183,9 +304,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         if self.ema is not None:
             self.ema.restore(self.flow_matching.parameters())
 
+    def _save_pretrained(self, save_directory: Path) -> None:
+        super()._save_pretrained(save_directory)
+        export_policy_to_tensorrt(self, self.config, save_directory)
 
-class FlowMatchingModel(nn.Module):
-    def __init__(self, config: FlowMatchingConfig):
+
+class FlowMatchingQATModel(nn.Module):
+    def __init__(self, config: FlowMatchingQATConfig):
         super().__init__()
         self.config = config
         self._velocity_net_compiled = False
@@ -194,16 +319,16 @@ class FlowMatchingModel(nn.Module):
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [FMRgbEncoder(config) for _ in range(num_images)]
+                encoders = [FMRgbEncoderQAT(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
                 global_cond_dim += encoders[0].feature_dim * num_images
             else:
-                self.rgb_encoder = FMRgbEncoder(config)
+                self.rgb_encoder = FMRgbEncoderQAT(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.velocity_net = FMConditionalUnet1d(
+        self.velocity_net = FMConditionalUnet1dQAT(
             config,
             global_cond_dim=global_cond_dim * config.n_obs_steps,
         )
@@ -219,9 +344,6 @@ class FlowMatchingModel(nn.Module):
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
         action_dim = self.config.action_feature.shape[0]
-        global_cond_dim = self.velocity_net.config.time_embed_dim + (self.velocity_net.config.time_embed_dim * 0)
-        del global_cond_dim  # keep lint quiet; actual conditioning shape is derived below
-
         obs_state_dim = self.config.robot_state_feature.shape[0]
         cond_dim = obs_state_dim
         if self.config.image_features:
@@ -449,10 +571,9 @@ class FlowMatchingModel(nn.Module):
 
         if reduction == "mean":
             return per_sample_loss.mean()
-        elif reduction == "none":
+        if reduction == "none":
             return per_sample_loss
-        else:
-            raise ValueError(f"Unsupported reduction: {reduction}")
+        raise ValueError(f"Unsupported reduction: {reduction}")
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
@@ -480,36 +601,8 @@ class FlowMatchingModel(nn.Module):
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
 
-class SpatialSoftmax(nn.Module):
-    def __init__(self, input_shape, num_kp=None):
-        super().__init__()
-        assert len(input_shape) == 3
-        self._in_c, self._in_h, self._in_w = input_shape
-
-        if num_kp is not None:
-            self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
-            self._out_c = num_kp
-        else:
-            self.nets = None
-            self._out_c = self._in_c
-
-        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
-        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
-        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
-        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
-
-    def forward(self, features: Tensor) -> Tensor:
-        if self.nets is not None:
-            features = self.nets(features)
-        features = features.reshape(-1, self._in_h * self._in_w)
-        attention = F.softmax(features, dim=-1)
-        expected_xy = attention @ self.pos_grid
-        feature_keypoints = expected_xy.view(-1, self._out_c, 2)
-        return feature_keypoints
-
-
-class FMRgbEncoder(nn.Module):
-    def __init__(self, config: FlowMatchingConfig):
+class FMRgbEncoderQAT(nn.Module):
+    def __init__(self, config: FlowMatchingQATConfig):
         super().__init__()
         if config.crop_shape is not None:
             self.do_crop = True
@@ -533,6 +626,13 @@ class FMRgbEncoder(nn.Module):
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
 
+        if config.qat_quantize_backbone:
+            self.backbone = _replace_submodules(
+                root_module=self.backbone,
+                predicate=lambda x: isinstance(x, nn.Conv2d),
+                func=lambda x: _make_qat_conv2d_from_conv(x, config),
+            )
+
         images_shape = next(iter(config.image_features.values())).shape
         dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
@@ -540,7 +640,7 @@ class FMRgbEncoder(nn.Module):
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+        self.out = QATLinear(config.spatial_softmax_num_keypoints * 2, self.feature_dim, config=config)
         self.relu = nn.ReLU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -551,32 +651,26 @@ class FMRgbEncoder(nn.Module):
         return x
 
 
-def _replace_submodules(
-    root_module: nn.Module,
-    predicate: Callable[[nn.Module], bool],
-    func: Callable[[nn.Module], nn.Module],
-) -> nn.Module:
-    if predicate(root_module):
-        return func(root_module)
-    replace_list = [k.split(".") for k, m in root_module.named_modules(remove_duplicate=True) if predicate(m)]
-    for *parents, k in replace_list:
-        parent_module = root_module
-        if len(parents) > 0:
-            parent_module = root_module.get_submodule(".".join(parents))
-        if isinstance(parent_module, nn.Sequential):
-            src_module = parent_module[int(k)]
-        else:
-            src_module = getattr(parent_module, k)
-        tgt_module = func(src_module)
-        if isinstance(parent_module, nn.Sequential):
-            parent_module[int(k)] = tgt_module
-        else:
-            setattr(parent_module, k, tgt_module)
-    assert not any(predicate(m) for _, m in root_module.named_modules(remove_duplicate=True))
-    return root_module
+def _make_qat_conv2d_from_conv(conv: nn.Conv2d, config: FlowMatchingQATConfig) -> QATConv2d:
+    qat_conv = QATConv2d(
+        conv.in_channels,
+        conv.out_channels,
+        conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        padding_mode=conv.padding_mode,
+        config=config,
+    )
+    qat_conv.weight.data.copy_(conv.weight.data)
+    if conv.bias is not None:
+        qat_conv.bias.data.copy_(conv.bias.data)
+    return qat_conv
 
 
-class FMSinusoidalPosEmb(nn.Module):
+class FMSinusoidalPosEmbQAT(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -591,25 +685,26 @@ class FMSinusoidalPosEmb(nn.Module):
         return emb
 
 
-class FMConv1dBlock(nn.Module):
-    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
+class FMConv1dBlockQAT(nn.Module):
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups, config: FlowMatchingQATConfig):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            QATConv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2, config=config),
             nn.GroupNorm(n_groups, out_channels),
             nn.Mish(),
         )
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         return self.block(x)
 
 
-class FMConditionalResidualBlock1d(nn.Module):
+class FMConditionalResidualBlock1dQAT(nn.Module):
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         cond_dim: int,
+        config: FlowMatchingQATConfig,
         kernel_size: int = 3,
         n_groups: int = 8,
         use_film_scale_modulation: bool = False,
@@ -618,15 +713,15 @@ class FMConditionalResidualBlock1d(nn.Module):
         self.use_film_scale_modulation = use_film_scale_modulation
         self.out_channels = out_channels
 
-        self.conv1 = FMConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
+        self.conv1 = FMConv1dBlockQAT(in_channels, out_channels, kernel_size, n_groups=n_groups, config=config)
 
         cond_channels = out_channels * 2 if use_film_scale_modulation else out_channels
-        self.cond_encoder = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, cond_channels))
+        self.cond_encoder = nn.Sequential(nn.Mish(), QATLinear(cond_dim, cond_channels, config=config))
 
-        self.conv2 = FMConv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups)
+        self.conv2 = FMConv1dBlockQAT(out_channels, out_channels, kernel_size, n_groups=n_groups, config=config)
 
         self.residual_conv = (
-            nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+            QATConv1d(in_channels, out_channels, 1, config=config) if in_channels != out_channels else nn.Identity()
         )
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
@@ -645,16 +740,16 @@ class FMConditionalResidualBlock1d(nn.Module):
         return out
 
 
-class FMConditionalUnet1d(nn.Module):
-    def __init__(self, config: FlowMatchingConfig, global_cond_dim: int):
+class FMConditionalUnet1dQAT(nn.Module):
+    def __init__(self, config: FlowMatchingQATConfig, global_cond_dim: int):
         super().__init__()
         self.config = config
 
         self.time_encoder = nn.Sequential(
-            FMSinusoidalPosEmb(config.time_embed_dim),
-            nn.Linear(config.time_embed_dim, config.time_embed_dim * 4),
+            FMSinusoidalPosEmbQAT(config.time_embed_dim),
+            QATLinear(config.time_embed_dim, config.time_embed_dim * 4, config=config),
             nn.Mish(),
-            nn.Linear(config.time_embed_dim * 4, config.time_embed_dim),
+            QATLinear(config.time_embed_dim * 4, config.time_embed_dim, config=config),
         )
 
         cond_dim = config.time_embed_dim + global_cond_dim
@@ -665,6 +760,7 @@ class FMConditionalUnet1d(nn.Module):
 
         common_res_block_kwargs = {
             "cond_dim": cond_dim,
+            "config": config,
             "kernel_size": config.kernel_size,
             "n_groups": config.n_groups,
             "use_film_scale_modulation": config.use_film_scale_modulation,
@@ -675,17 +771,27 @@ class FMConditionalUnet1d(nn.Module):
             self.down_modules.append(
                 nn.ModuleList(
                     [
-                        FMConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
-                        FMConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
-                        nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
+                        FMConditionalResidualBlock1dQAT(dim_in, dim_out, **common_res_block_kwargs),
+                        FMConditionalResidualBlock1dQAT(dim_out, dim_out, **common_res_block_kwargs),
+                        QATConv1d(dim_out, dim_out, 3, stride=2, padding=1, config=config)
+                        if not is_last
+                        else nn.Identity(),
                     ]
                 )
             )
 
         self.mid_modules = nn.ModuleList(
             [
-                FMConditionalResidualBlock1d(config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs),
-                FMConditionalResidualBlock1d(config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs),
+                FMConditionalResidualBlock1dQAT(
+                    config.down_dims[-1],
+                    config.down_dims[-1],
+                    **common_res_block_kwargs,
+                ),
+                FMConditionalResidualBlock1dQAT(
+                    config.down_dims[-1],
+                    config.down_dims[-1],
+                    **common_res_block_kwargs,
+                ),
             ]
         )
 
@@ -695,16 +801,18 @@ class FMConditionalUnet1d(nn.Module):
             self.up_modules.append(
                 nn.ModuleList(
                     [
-                        FMConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
-                        FMConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
-                        nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
+                        FMConditionalResidualBlock1dQAT(dim_in * 2, dim_out, **common_res_block_kwargs),
+                        FMConditionalResidualBlock1dQAT(dim_out, dim_out, **common_res_block_kwargs),
+                        QATConvTranspose1d(dim_out, dim_out, 4, stride=2, padding=1, config=config)
+                        if not is_last
+                        else nn.Identity(),
                     ]
                 )
             )
 
         self.final_conv = nn.Sequential(
-            FMConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
+            FMConv1dBlockQAT(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size, n_groups=config.n_groups, config=config),
+            QATConv1d(config.down_dims[0], config.action_feature.shape[0], 1, config=config),
         )
 
     def forward(self, x: Tensor, time: Tensor, global_cond: Tensor | None = None) -> Tensor:

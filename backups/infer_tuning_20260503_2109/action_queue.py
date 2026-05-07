@@ -185,12 +185,14 @@ class ActionQueue:
         if (
             preserve_prefix_steps > 0 or transition_blend_steps > 0
         ) and self.queue is not None and self.last_index < len(self.queue):
-            old_original_queue = self.original_queue[self.last_index :].clone()
-            old_queue = self.queue[self.last_index :].clone()
-            old_original_queue = old_original_queue.to(
-                device=new_original_queue.device, dtype=new_original_queue.dtype
-            )
-            old_queue = old_queue.to(device=new_queue.device, dtype=new_queue.dtype)
+            old_original_queue = self.original_queue[self.last_index :].to(
+                device=new_original_queue.device,
+                dtype=new_original_queue.dtype,
+            ).clone()
+            old_queue = self.queue[self.last_index :].to(
+                device=new_queue.device,
+                dtype=new_queue.dtype,
+            ).clone()
 
             preserve_prefix_steps = min(preserve_prefix_steps, len(old_queue), len(new_queue))
             transition_blend_steps = min(
@@ -208,19 +210,19 @@ class ActionQueue:
                     processed_parts.append(old_queue[:preserve_prefix_steps])
 
                 if transition_blend_steps > 0:
-                    original_blend_weights = torch.linspace(
-                        1.0 / (transition_blend_steps + 1),
-                        transition_blend_steps / (transition_blend_steps + 1),
-                        steps=transition_blend_steps,
-                        device=new_original_queue.device,
-                        dtype=new_original_queue.dtype,
-                    ).unsqueeze(-1)
                     processed_blend_weights = torch.linspace(
                         1.0 / (transition_blend_steps + 1),
                         transition_blend_steps / (transition_blend_steps + 1),
                         steps=transition_blend_steps,
                         device=new_queue.device,
                         dtype=new_queue.dtype,
+                    ).unsqueeze(-1)
+                    original_blend_weights = torch.linspace(
+                        1.0 / (transition_blend_steps + 1),
+                        transition_blend_steps / (transition_blend_steps + 1),
+                        steps=transition_blend_steps,
+                        device=new_original_queue.device,
+                        dtype=new_original_queue.dtype,
                     ).unsqueeze(-1)
 
                     old_original_blend = old_original_queue[
@@ -303,12 +305,18 @@ class ActionQueue:
             self.queue = processed_actions.clone()
             return
 
-        self.original_queue = self.original_queue.to(device=original_actions.device, dtype=original_actions.dtype)
-        self.original_queue = torch.cat([self.original_queue, original_actions.clone()])
+        existing_original_queue = self.original_queue.to(
+            device=original_actions.device,
+            dtype=original_actions.dtype,
+        )
+        self.original_queue = torch.cat([existing_original_queue, original_actions.clone()])
         self.original_queue = self.original_queue[self.last_index :]
 
-        self.queue = self.queue.to(device=processed_actions.device, dtype=processed_actions.dtype)
-        self.queue = torch.cat([self.queue, processed_actions.clone()])
+        existing_queue = self.queue.to(
+            device=processed_actions.device,
+            dtype=processed_actions.dtype,
+        )
+        self.queue = torch.cat([existing_queue, processed_actions.clone()])
         self.queue = self.queue[self.last_index :]
 
         self.last_index = 0

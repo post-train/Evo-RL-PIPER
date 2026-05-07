@@ -6,6 +6,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
 
 @PreTrainedConfig.register_subclass("vita")
@@ -31,7 +32,6 @@ class VitaConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     use_frozen_batch_norm: bool = True
-
     latent_dim: int = 512
 
     flow_matcher_name: str = "exact"
@@ -75,6 +75,12 @@ class VitaConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 500
     use_ema: bool = True
     ema_power: float = 0.75
+    rtc_config: RTCConfig | None = None
+    infer_safe_delta_enabled: bool = True
+    infer_safe_delta_max_norm: float = 0.02
+    infer_no_rtc_replan_every_step: bool = True
+    infer_no_rtc_refresh_steps: int = 2
+    infer_no_rtc_blend_steps: int = 2
 
     def __post_init__(self) -> None:
         super().__post_init__()

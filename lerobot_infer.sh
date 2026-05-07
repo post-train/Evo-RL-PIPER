@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-POLICY_PATH="${POLICY_PATH:-/home/szk/szk/Evo-RL/outputs/flow_matching_train_20260430_170525/checkpoints/080000/pretrained_model}"
+POLICY_PATH="${POLICY_PATH:-/home/szk/szk/Evo-RL/outputs/flow_matching_train_20260503_224226/checkpoints/080000/pretrained_model}"
 DATASET_ROOT="${DATASET_ROOT:-/home/szk/szk/Evo-RL/outputs/flow_matching_infer_80k}"
 
 if [[ -d "${DATASET_ROOT}" ]]; then

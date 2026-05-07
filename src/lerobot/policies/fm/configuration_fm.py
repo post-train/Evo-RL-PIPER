@@ -41,14 +41,19 @@ class FlowMatchingConfig(PreTrainedConfig):
     time_embed_dim: int = 256
     use_film_scale_modulation: bool = True
 
-    num_inference_steps: int = 10
+    num_inference_steps: int = 14
     solver_type: str = "euler"
     ode_atol: float = 1e-5
     ode_rtol: float = 1e-5
     clip_sample: bool = True
     clip_sample_range: float = 1.0
+    compile_velocity_net: bool = True
+    compile_mode: str = "reduce-overhead"
+    compile_warmup_num_chunks: int = 1
 
     do_mask_loss_for_padding: bool = False
+    rollout_consistency_weight: float = 0.1
+    rollout_consistency_num_steps: int = 14
 
     use_ema: bool = True
     ema_power: float = 0.75
@@ -71,6 +76,18 @@ class FlowMatchingConfig(PreTrainedConfig):
         supported_solvers = ["euler", "dopri5"]
         if self.solver_type not in supported_solvers:
             raise ValueError(f"`solver_type` must be one of {supported_solvers}. Got {self.solver_type}.")
+
+        supported_compile_modes = ["default", "reduce-overhead", "max-autotune"]
+        if self.compile_mode not in supported_compile_modes:
+            raise ValueError(
+                f"`compile_mode` must be one of {supported_compile_modes}. Got {self.compile_mode}."
+            )
+        if self.compile_warmup_num_chunks < 0:
+            raise ValueError("`compile_warmup_num_chunks` must be >= 0.")
+        if self.rollout_consistency_weight < 0:
+            raise ValueError("`rollout_consistency_weight` must be >= 0.")
+        if self.rollout_consistency_num_steps < 0:
+            raise ValueError("`rollout_consistency_num_steps` must be >= 0.")
 
         if self.solver_type == "dopri5":
             try:

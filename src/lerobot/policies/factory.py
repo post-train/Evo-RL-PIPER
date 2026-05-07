@@ -36,6 +36,7 @@ from lerobot.policies.cage.configuration_cage import CAGEConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.evo1.configuration_evo1 import Evo1Config
 from lerobot.policies.fm.configuration_fm import FlowMatchingConfig
+from lerobot.policies.fm_qat.configuration_fm_qat import FlowMatchingQATConfig
 from lerobot.policies.original_a2a.configuration_diffusion import OriginalA2AConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -94,6 +95,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.fm.modeling_fm import FlowMatchingPolicy
 
         return FlowMatchingPolicy
+    elif name == "flow_matching_qat":
+        from lerobot.policies.fm_qat.modeling_fm_qat import FlowMatchingQATPolicy
+
+        return FlowMatchingQATPolicy
     elif name == "diffusion":
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
@@ -161,6 +166,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return CAGEConfig(**kwargs)
     elif policy_type == "flow_matching":
         return FlowMatchingConfig(**kwargs)
+    elif policy_type == "flow_matching_qat":
+        return FlowMatchingQATConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
@@ -277,6 +284,14 @@ def make_pre_post_processors(
         from lerobot.policies.abpolicy.processor_ab import make_ab_pre_post_processors
 
         processors = make_ab_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, FlowMatchingQATConfig):
+        from lerobot.policies.fm_qat.processor_fm_qat import make_flow_matching_qat_pre_post_processors
+
+        processors = make_flow_matching_qat_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

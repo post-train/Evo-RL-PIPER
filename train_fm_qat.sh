@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 中文简介：训练 Flow Matching 策略的主脚本，支持设置骨干网络、步数和采样参数。
+# 中文简介：训练 Flow Matching QAT(INT8) 策略的主脚本，沿用 train_fm.sh 的超参数，并启用独立的 QAT policy。
 
 set -euo pipefail
 
@@ -27,13 +27,15 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 SOLVER_TYPE="${SOLVER_TYPE:-euler}"
 USE_EMA="${USE_EMA:-true}"
 EMA_POWER="${EMA_POWER:-0.75}"
+TRT_EXPORT_ON_SAVE="${TRT_EXPORT_ON_SAVE:-true}"
+TRT_REFERENCE_PRETRAINED_PATH="${TRT_REFERENCE_PRETRAINED_PATH:-}"
 
 export HF_HOME="${HF_HOME:-${CACHE_ROOT}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${CACHE_ROOT}/datasets}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${CACHE_ROOT}/hub}"
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HUGGINGFACE_HUB_CACHE}" "${OUTPUT_ROOT}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/flow_matching_train_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/flow_matching_qat_train_$(date +%Y%m%d_%H%M%S)}"
 
 if [[ "${PRETRAINED_BACKBONE_WEIGHTS}" == "AUTO" ]]; then
     PRETRAINED_BACKBONE_WEIGHTS="ResNet18_Weights.IMAGENET1K_V1"
@@ -43,7 +45,7 @@ if [[ "${USE_GROUP_NORM}" == "AUTO" ]]; then
 fi
 
 python src/lerobot/scripts/lerobot_train.py \
-    --policy.type=flow_matching \
+    --policy.type=flow_matching_qat \
     --policy.push_to_hub=false \
     --policy.device="${POLICY_DEVICE}" \
     --policy.vision_backbone="${VISION_BACKBONE}" \
@@ -57,6 +59,7 @@ python src/lerobot/scripts/lerobot_train.py \
     --policy.solver_type="${SOLVER_TYPE}" \
     --policy.use_ema="${USE_EMA}" \
     --policy.ema_power="${EMA_POWER}" \
+    --policy.trt_export_on_save="${TRT_EXPORT_ON_SAVE}" \
     --dataset.repo_id="${DATASET_REPO_ID}" \
     --dataset.root="${DATASET_ROOT}" \
     --dataset.video_backend=pyav \
@@ -68,4 +71,5 @@ python src/lerobot/scripts/lerobot_train.py \
     --eval_freq="${EVAL_FREQ}" \
     --log_freq="${LOG_FREQ}" \
     --output_dir="${OUTPUT_DIR}" \
-    --wandb.enable="${WANDB_ENABLE}"
+    --wandb.enable="${WANDB_ENABLE}" \
+    ${TRT_REFERENCE_PRETRAINED_PATH:+--policy.trt_reference_pretrained_path="${TRT_REFERENCE_PRETRAINED_PATH}"}

@@ -16,6 +16,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from diffusers.training_utils import EMAModel
 
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.utils import populate_queues
 from lerobot.policies.vita.configuration_diffusion import VitaConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
@@ -46,10 +47,13 @@ class VitaPolicy(PreTrainedPolicy):
         self.obs_horizon = config.obs_horizon
         self.action_horizon = config.action_horizon
         self.pred_horizon = config.pred_horizon
-        self._obs_queues = None
+        self._queues = None
         self._action_queue = None
         self.model = VitaModel(config, dataset_stats=dataset_stats)
         self.ema = EMAModel(parameters=self.model.parameters(), power=config.ema_power) if config.use_ema else None
+        self.rtc_processor: RTCProcessor | None = None
+        if config.rtc_config is not None:
+            self.rtc_processor = RTCProcessor(config.rtc_config)
         self.reset()
 
     def get_optim_params(self) -> list[dict]:
@@ -73,20 +77,138 @@ class VitaPolicy(PreTrainedPolicy):
             self.ema.restore(self.model.parameters())
 
     def reset(self):
-        self._obs_queues = {
+        self._queues = {
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
             OBS_IMAGES: deque(maxlen=self.config.n_obs_steps),
         }
         self._action_queue = deque([], maxlen=self.action_horizon)
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        inference_delay: int | None = None,
+        prev_chunk_left_over: Tensor | None = None,
+        execution_horizon: int | None = None,
+    ) -> Tensor:
         del noise
-        stacked = {k: torch.stack(list(self._obs_queues[k]), dim=1) for k in batch if k in self._obs_queues}
-        return self.model.generate_actions(stacked)
+        del execution_horizon
+        batch = self._prepare_observation_batch(batch)
+        self._maybe_populate_history(batch)
+        stacked = self._stack_history_batch()
+        with self._ema_scope():
+            pred_actions = self.model.generate_actions(stacked)
+        pred_actions = pred_actions[:, : self.action_horizon]
+        if prev_chunk_left_over is not None and inference_delay and inference_delay > 0:
+            pred_actions = self._apply_prefix_guidance(
+                pred_actions,
+                prev_chunk_left_over=prev_chunk_left_over,
+                inference_delay=inference_delay,
+            )
+        pred_actions = self._apply_inference_safety_limits(pred_actions, stacked)
+        return pred_actions
 
     def _queue_observation(self, batch: dict[str, Tensor]) -> None:
-        self._obs_queues = populate_queues(self._obs_queues, batch)
+        self._queues = populate_queues(self._queues, batch)
+
+    def _prepare_observation_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch = dict(batch)
+        if ACTION in batch:
+            batch.pop(ACTION)
+        if OBS_IMAGES not in batch and self.config.image_features:
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        return batch
+
+    def _maybe_populate_history(self, batch: dict[str, Tensor]) -> None:
+        if self._queues is None:
+            self.reset()
+        state_history = self._queues[OBS_STATE]
+        state_value = batch.get(OBS_STATE)
+        if state_value is None:
+            return
+        expected_len = state_history.maxlen
+        already_stacked = state_value.ndim >= 3 and state_value.shape[1] == expected_len
+        if already_stacked:
+            restored_queues: dict[str, deque] = {}
+            for key, queue_value in self._queues.items():
+                if key not in batch:
+                    restored_queues[key] = deque(maxlen=queue_value.maxlen)
+                    continue
+                restored_queues[key] = deque(
+                    (frame.detach().clone() for frame in batch[key].unbind(dim=1)),
+                    maxlen=queue_value.maxlen,
+                )
+            self._queues = restored_queues
+            return
+        self._queue_observation(batch)
+
+    def _stack_history_batch(self) -> dict[str, Tensor]:
+        if self._queues is None:
+            raise RuntimeError("VITA observation history is not initialized.")
+        return {key: torch.stack(list(queue_value), dim=1) for key, queue_value in self._queues.items() if len(queue_value) > 0}
+
+    def _apply_prefix_guidance(
+        self,
+        pred_actions: Tensor,
+        *,
+        prev_chunk_left_over: Tensor,
+        inference_delay: int,
+    ) -> Tensor:
+        if prev_chunk_left_over.ndim == 2:
+            prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+        prefix_steps = min(inference_delay, pred_actions.shape[1], prev_chunk_left_over.shape[1])
+        if prefix_steps <= 0:
+            return pred_actions
+
+        guided_actions = pred_actions.clone()
+        guided_actions[:, :prefix_steps, :] = prev_chunk_left_over[:, :prefix_steps, :].to(
+            device=guided_actions.device,
+            dtype=guided_actions.dtype,
+        )
+
+        blend_steps = min(2, guided_actions.shape[1] - prefix_steps, prev_chunk_left_over.shape[1] - prefix_steps)
+        if blend_steps > 0:
+            prev_blend = prev_chunk_left_over[:, prefix_steps : prefix_steps + blend_steps, :].to(
+                device=guided_actions.device,
+                dtype=guided_actions.dtype,
+            )
+            weights = torch.linspace(
+                1.0 / (blend_steps + 1),
+                blend_steps / (blend_steps + 1),
+                steps=blend_steps,
+                device=guided_actions.device,
+                dtype=guided_actions.dtype,
+            ).view(1, blend_steps, 1)
+            guided_actions[:, prefix_steps : prefix_steps + blend_steps, :] = (
+                (1.0 - weights) * prev_blend
+                + weights * guided_actions[:, prefix_steps : prefix_steps + blend_steps, :]
+            )
+        return guided_actions
+
+    def _apply_inference_safety_limits(
+        self,
+        pred_actions: Tensor,
+        stacked_observation: dict[str, Tensor],
+    ) -> Tensor:
+        if not self.config.infer_safe_delta_enabled:
+            return pred_actions
+        state_history = stacked_observation.get(OBS_STATE)
+        if state_history is None or state_history.shape[-1] != pred_actions.shape[-1]:
+            return pred_actions
+
+        max_delta = float(self.config.infer_safe_delta_max_norm)
+        if max_delta <= 0:
+            return pred_actions
+
+        clamped_actions = pred_actions.clone()
+        reference = state_history[:, -1, :].to(device=pred_actions.device, dtype=pred_actions.dtype)
+        for step in range(clamped_actions.shape[1]):
+            delta = clamped_actions[:, step, :] - reference
+            delta = delta.clamp(min=-max_delta, max=max_delta)
+            clamped_actions[:, step, :] = reference + delta
+            reference = clamped_actions[:, step, :]
+        return clamped_actions
 
     def _ensure_ema_device(self) -> None:
         if self.ema is None:
@@ -118,19 +240,52 @@ class VitaPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         del noise
-        if ACTION in batch:
-            batch.pop(ACTION)
-        batch = dict(batch)
-        batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        batch = self._prepare_observation_batch(batch)
         self._queue_observation(batch)
-        if len(self._action_queue) == 0:
-            with self._ema_scope():
-                pred_actions = self.predict_action_chunk(batch)
+        refresh_after_steps = self.config.action_queue_refresh_steps
+        if self.config.infer_no_rtc_replan_every_step and not self._rtc_enabled():
+            refresh_after_steps = max(1, self.config.infer_no_rtc_refresh_steps)
+        refresh_threshold = max(self.action_horizon - refresh_after_steps, 0)
+        if len(self._action_queue) == 0 or len(self._action_queue) <= refresh_threshold:
+            previous_actions = None
+            if not self._rtc_enabled() and len(self._action_queue) > 0:
+                previous_actions = torch.stack(list(self._action_queue), dim=1)
+            pred_actions = self.predict_action_chunk(batch)
             pred_actions = pred_actions[:, : self.action_horizon]
+            if previous_actions is not None:
+                pred_actions = self._blend_with_existing_plan(pred_actions, previous_actions)
             self._action_queue.clear()
             self._action_queue.extend(pred_actions.transpose(0, 1))
         action = self._action_queue.popleft()
         return action
+
+    def _rtc_enabled(self) -> bool:
+        return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _blend_with_existing_plan(
+        self,
+        pred_actions: Tensor,
+        previous_actions: Tensor,
+    ) -> Tensor:
+        blend_steps = min(
+            self.config.infer_no_rtc_blend_steps,
+            pred_actions.shape[1],
+            previous_actions.shape[1],
+        )
+        if blend_steps <= 0:
+            return pred_actions
+
+        blended_actions = pred_actions.clone()
+        prev = previous_actions[:, :blend_steps, :].to(device=pred_actions.device, dtype=pred_actions.dtype)
+        weights = torch.linspace(
+            1.0 / (blend_steps + 1),
+            blend_steps / (blend_steps + 1),
+            steps=blend_steps,
+            device=pred_actions.device,
+            dtype=pred_actions.dtype,
+        ).view(1, blend_steps, 1)
+        blended_actions[:, :blend_steps, :] = (1.0 - weights) * prev + weights * blended_actions[:, :blend_steps, :]
+        return blended_actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         batch = dict(batch)
@@ -811,20 +966,6 @@ class SimpleFlowNet(nn.Module):
         return self.out_proj(x)
 
 
-class _FallbackConditionalFlowMatcher:
-    def __init__(self, sigma: float = 0.0):
-        self.sigma = sigma
-
-    def sample_location_and_conditional_flow(self, x0: Tensor, x1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        t = torch.rand(x0.shape[0], device=x0.device, dtype=x0.dtype)
-        noise = torch.randn_like(x0) * self.sigma if self.sigma > 0 else 0.0
-        xt = (1.0 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * x1
-        if isinstance(noise, Tensor):
-            xt = xt + noise
-        ut = x1 - x0
-        return t, xt, ut
-
-
 class TorchFlowMatcher:
     def __init__(self, fm, num_sampling_steps: int = 6):
         self.fm = fm
@@ -870,7 +1011,10 @@ class TorchFlowMatcherFactory:
     @staticmethod
     def make(name: str, sigma: float, num_sampling_steps: int) -> TorchFlowMatcher:
         if TorchCFMConditionalFlowMatcher is None:
-            return TorchFlowMatcher(_FallbackConditionalFlowMatcher(sigma=sigma), num_sampling_steps=num_sampling_steps)
+            raise ImportError(
+                "VITA requires `torchcfm` to match the original implementation. "
+                "Install it before training or inference, e.g. `pip install torchcfm`."
+            )
 
         mapping = {
             "conditional": TorchCFMConditionalFlowMatcher,
